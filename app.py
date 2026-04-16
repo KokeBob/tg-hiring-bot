@@ -31,8 +31,9 @@ HELP_TEXT = (
     "Команды для админов:\n\n"
     "/chatid — показать ID текущего чата\n"
     "/reply <текст> — ответить кандидату, если команда отправлена reply на карточку кандидата\n"
-    "/reply <user_id> <текст> — ответить кандидату вручную по user_id\n\n"
-    "Рекомендуемый способ:\n"
+    "/reply <user_id> <текст> — ответить кандидату вручную по user_id\n"
+    "/waitlist — показать список кандидатов в резерве\n\n"
+    "Рекомендуемый способ ответа:\n"
     "1. В админ-чате нажми Reply на сообщение по кандидату\n"
     "2. Напиши /reply <твой текст>"
 )
@@ -49,7 +50,8 @@ def load_state() -> dict:
             logger.exception("Failed to load state.json")
     return {
         "admin_message_to_user": {},   # admin_message_id -> user_id
-        "decisions": {}                # user_id -> accepted/rejected/custom
+        "decisions": {},               # user_id -> accepted/rejected/waitlist/custom
+        "users": {}                    # user_id -> info
     }
 
 
@@ -72,6 +74,7 @@ def keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Подходит", callback_data=f"accept:{user_id}"),
+            InlineKeyboardButton("⏳ В резерв", callback_data=f"waitlist:{user_id}"),
             InlineKeyboardButton("❌ Не подходит", callback_data=f"reject:{user_id}")
         ]
     ])
@@ -95,6 +98,27 @@ def mark_decision(user_id: int, decision: str) -> None:
     save_state(STATE)
 
 
+def save_user_info(user_id: int, full_name: str, username: str | None) -> None:
+    STATE["users"][str(user_id)] = {
+        "full_name": full_name,
+        "username": username or "",
+    }
+    save_state(STATE)
+
+
+def get_waitlist_users():
+    result = []
+    for user_id, decision in STATE["decisions"].items():
+        if decision == "waitlist":
+            info = STATE["users"].get(str(user_id), {})
+            result.append({
+                "user_id": user_id,
+                "full_name": info.get("full_name", "Без имени"),
+                "username": info.get("username", ""),
+            })
+    return result
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(WELCOME_TEXT)
@@ -112,13 +136,34 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Current chat ID: {update.effective_chat.id}")
 
 
+async def waitlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_chat(update):
+        return
+    if not update.message:
+        return
+
+    users = get_waitlist_users()
+
+    if not users:
+        await update.message.reply_text("Список резерва пока пуст.")
+        return
+
+    lines = ["Кандидаты в резерве:\n"]
+    for i, user in enumerate(users, start=1):
+        username_part = f"@{user['username']}" if user["username"] else "без username"
+        lines.append(
+            f"{i}. {user['full_name']} — {username_part} — ID: {user['user_id']}"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_chat(update):
         return
     if not update.message:
         return
 
-    # Вариант 1: reply на сообщение о кандидате
     if update.message.reply_to_message and context.args:
         replied_message_id = update.message.reply_to_message.message_id
         user_id = get_user_id_from_admin_message(replied_message_id)
@@ -134,7 +179,6 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Не удалось отправить сообщение: {e}")
             return
 
-    # Вариант 2: /reply <user_id> <текст>
     if len(context.args) >= 2:
         try:
             user_id = int(context.args[0])
@@ -178,6 +222,8 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat.type != "private":
         return
+
+    save_user_info(user.id, user.full_name, user.username)
 
     header = (
         "Новая заявка\n\n"
@@ -241,7 +287,6 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Ошибка обработки кнопки.")
         return
 
-    # Уже приняли решение ранее
     if has_decision(user_id):
         await query.answer("Решение уже принято", show_alert=True)
         try:
@@ -257,6 +302,17 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         status = "Статус: ПОДХОДИТ ✅"
         decision_value = "accepted"
+
+    elif action == "waitlist":
+        text = (
+            "Спасибо за отклик! Твоя заявка показалась нам сильной и интересной.\n\n"
+            "Сейчас мы продолжаем рассматривать других кандидатов и принимать финальные решения по составу команды. "
+            "Пока что мы добавили тебя в резерв и можем вернуться к твоей кандидатуре чуть позже.\n\n"
+            "Спасибо за интерес к нашей команде!"
+        )
+        status = "Статус: В РЕЗЕРВЕ ⏳"
+        decision_value = "waitlist"
+
     else:
         text = (
             "Спасибо за отклик и за время, которое ты уделил заявке.\n\n"
@@ -269,10 +325,8 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text=text)
         mark_decision(user_id, decision_value)
 
-        # убираем кнопки
         await query.edit_message_reply_markup(reply_markup=None)
 
-        # дописываем статус
         try:
             old_text = query.message.text or ""
             new_text = f"{old_text}\n\n{status}"
@@ -298,6 +352,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("reply", reply_cmd))
+    app.add_handler(CommandHandler("waitlist", waitlist_cmd))
     app.add_handler(CallbackQueryHandler(handle_decision))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_submission))
 
