@@ -98,12 +98,34 @@ def mark_decision(user_id: int, decision: str) -> None:
     save_state(STATE)
 
 
-def save_user_info(user_id: int, full_name: str, username: str | None) -> None:
+def save_user_info(user_id: int, full_name: str, username: str | None, chat_id: int | None = None) -> None:
+    existing = STATE["users"].get(str(user_id), {})
     STATE["users"][str(user_id)] = {
         "full_name": full_name,
         "username": username or "",
+        "chat_id": chat_id if chat_id is not None else existing.get("chat_id"),
     }
     save_state(STATE)
+
+
+def get_user_chat_id(user_id: int):
+    user_info = STATE["users"].get(str(user_id), {})
+    return user_info.get("chat_id")
+
+
+async def send_feedback_to_candidate(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    text: str,
+):
+    chat_id = get_user_chat_id(user_id)
+
+    if not chat_id:
+        raise RuntimeError(
+            "У кандидата не найден chat_id. Пусть кандидат сначала напишет боту или заново отправит заявку."
+        )
+
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 def get_waitlist_users():
@@ -120,6 +142,14 @@ def get_waitlist_users():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_chat:
+        save_user_info(
+            update.effective_user.id,
+            update.effective_user.full_name,
+            update.effective_user.username,
+            update.effective_chat.id,
+        )
+
     if update.message:
         await update.message.reply_text(WELCOME_TEXT)
 
@@ -171,8 +201,8 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id:
             text = " ".join(context.args).strip()
             try:
-                await context.bot.send_message(chat_id=user_id, text=text)
-                mark_decision(user_id, "custom")
+                await send_feedback_to_candidate(context, int(user_id), text)
+                mark_decision(int(user_id), "custom")
                 await update.message.reply_text("Кастомный ответ отправлен кандидату.")
             except Exception as e:
                 logger.exception("Failed to send reply via replied message")
@@ -195,7 +225,7 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = " ".join(context.args[1:]).strip()
 
         try:
-            await context.bot.send_message(chat_id=user_id, text=text)
+            await send_feedback_to_candidate(context, user_id, text)
             mark_decision(user_id, "custom")
             await update.message.reply_text("Кастомный ответ отправлен кандидату.")
         except Exception as e:
@@ -223,7 +253,7 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type != "private":
         return
 
-    save_user_info(user.id, user.full_name, user.username)
+    save_user_info(user.id, user.full_name, user.username, chat.id)
 
     header = (
         "Новая заявка\n\n"
@@ -278,13 +308,13 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not query.message:
         return
 
-    await query.answer()
-
     try:
         action, user_id_raw = query.data.split(":")
         user_id = int(user_id_raw)
     except Exception:
-        await query.message.reply_text("Ошибка обработки кнопки.")
+        await query.answer("Ошибка кнопки", show_alert=True)
+        if query.message:
+            await query.message.reply_text("Ошибка обработки кнопки.")
         return
 
     if has_decision(user_id):
@@ -321,11 +351,16 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "Статус: НЕ ПОДХОДИТ ❌"
         decision_value = "rejected"
 
+    await query.answer("Отправляю ответ...")
+
     try:
-        await context.bot.send_message(chat_id=user_id, text=text)
+        await send_feedback_to_candidate(context, user_id, text)
         mark_decision(user_id, decision_value)
 
-        await query.edit_message_reply_markup(reply_markup=None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.exception("Failed to remove inline keyboard")
 
         try:
             old_text = query.message.text or ""
@@ -335,6 +370,7 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text(status)
         except Exception:
+            logger.exception("Failed to edit message text with status")
             await query.message.reply_text(status)
 
     except Exception as e:
