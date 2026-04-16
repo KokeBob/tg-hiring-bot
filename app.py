@@ -1,8 +1,7 @@
 import os
+import json
 import logging
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
+from pathlib import Path
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "1"))
-PORT = int(os.getenv("PORT", "8080"))
 
 WELCOME_TEXT = (
     "Привет! Отправь сюда своё резюме или информацию о себе.\n\n"
@@ -29,10 +27,48 @@ WELCOME_TEXT = (
     "Мы рассмотрим заявку и ответим здесь от имени бота."
 )
 
+HELP_TEXT = (
+    "Команды для админов:\n\n"
+    "/chatid — показать ID текущего чата\n"
+    "/reply <текст> — ответить кандидату, если команда отправлена reply на карточку кандидата\n"
+    "/reply <user_id> <текст> — ответить кандидату вручную по user_id\n\n"
+    "Рекомендуемый способ:\n"
+    "1. В админ-чате нажми Reply на сообщение по кандидату\n"
+    "2. Напиши /reply <твой текст>"
+)
+
+DATA_FILE = Path("state.json")
+
+
+def load_state() -> dict:
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Failed to load state.json")
+    return {
+        "admin_message_to_user": {},   # admin_message_id -> user_id
+        "decisions": {}                # user_id -> accepted/rejected/custom
+    }
+
+
+def save_state(state: dict) -> None:
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("Failed to save state.json")
+
+
+STATE = load_state()
+
+
 def is_admin_chat(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID)
 
-def build_keyboard(user_id: int) -> InlineKeyboardMarkup:
+
+def keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Подходит", callback_data=f"accept:{user_id}"),
@@ -40,61 +76,97 @@ def build_keyboard(user_id: int) -> InlineKeyboardMarkup:
         ]
     ])
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ["/", "/health", "/healthz"]:
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        else:
-            self.send_response(404)
-            self.end_headers()
 
-    def log_message(self, format, *args):
-        return
+def set_mapping(admin_message_id: int, user_id: int) -> None:
+    STATE["admin_message_to_user"][str(admin_message_id)] = user_id
+    save_state(STATE)
 
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health server started on port {PORT}")
-    server.serve_forever()
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_user_id_from_admin_message(message_id: int):
+    return STATE["admin_message_to_user"].get(str(message_id))
+
+
+def has_decision(user_id: int) -> bool:
+    return str(user_id) in STATE["decisions"]
+
+
+def mark_decision(user_id: int, decision: str) -> None:
+    STATE["decisions"][str(user_id)] = decision
+    save_state(STATE)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(WELCOME_TEXT)
 
-async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_chat(update):
+        return
+    if update.message:
+        await update.message.reply_text(HELP_TEXT)
+
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(f"Current chat ID: {update.effective_chat.id}")
+
 
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_chat(update):
         return
-
     if not update.message:
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Использование:\n/reply <user_id> <текст>\n\n"
-            "Пример:\n/reply 123456789 Спасибо! Хотим пригласить тебя на интервью."
-        )
+    # Вариант 1: reply на сообщение о кандидате
+    if update.message.reply_to_message and context.args:
+        replied_message_id = update.message.reply_to_message.message_id
+        user_id = get_user_id_from_admin_message(replied_message_id)
+
+        if user_id:
+            text = " ".join(context.args).strip()
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text)
+                mark_decision(user_id, "custom")
+                await update.message.reply_text("Кастомный ответ отправлен кандидату.")
+            except Exception as e:
+                logger.exception("Failed to send reply via replied message")
+                await update.message.reply_text(f"Не удалось отправить сообщение: {e}")
+            return
+
+    # Вариант 2: /reply <user_id> <текст>
+    if len(context.args) >= 2:
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "Неверный формат.\n\n"
+                "Либо ответь реплаем на карточку кандидата:\n"
+                "/reply Спасибо! Хотим позвать тебя на интервью.\n\n"
+                "Либо используй:\n"
+                "/reply <user_id> <текст>"
+            )
+            return
+
+        text = " ".join(context.args[1:]).strip()
+
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            mark_decision(user_id, "custom")
+            await update.message.reply_text("Кастомный ответ отправлен кандидату.")
+        except Exception as e:
+            logger.exception("Failed to send manual reply")
+            await update.message.reply_text(f"Не удалось отправить сообщение: {e}")
         return
 
-    try:
-        user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Ошибка: user_id должен быть числом.")
-        return
+    await update.message.reply_text(
+        "Использование:\n\n"
+        "1. Ответь реплаем на карточку кандидата:\n"
+        "/reply Спасибо! Хотим позвать тебя на интервью.\n\n"
+        "2. Или вручную:\n"
+        "/reply <user_id> <текст>"
+    )
 
-    text = " ".join(context.args[1:]).strip()
-
-    try:
-        await context.bot.send_message(chat_id=user_id, text=text)
-        await update.message.reply_text("Сообщение отправлено кандидату от имени бота.")
-    except Exception as e:
-        logger.exception("Failed to send custom reply")
-        await update.message.reply_text(f"Не удалось отправить сообщение: {e}")
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -116,32 +188,48 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if msg.text:
-            await context.bot.send_message(
+            admin_msg = await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"{header}\n\nТекст заявки:\n{msg.text}",
-                reply_markup=build_keyboard(user.id)
+                text=(
+                    f"{header}\n\n"
+                    f"Текст заявки:\n{msg.text}\n\n"
+                    f"Чтобы ответить вручную, нажми Reply на это сообщение и напиши:\n"
+                    f"/reply <твой текст>"
+                ),
+                reply_markup=keyboard(user.id)
             )
+            set_mapping(admin_msg.message_id, user.id)
+
         else:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=header)
-            await msg.forward(chat_id=ADMIN_CHAT_ID)
-            await context.bot.send_message(
+            header_msg = await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=header
+            )
+            set_mapping(header_msg.message_id, user.id)
+
+            forwarded_msg = await msg.forward(chat_id=ADMIN_CHAT_ID)
+            set_mapping(forwarded_msg.message_id, user.id)
+
+            decision_msg = await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=(
                     f"Решение по кандидату {user.full_name} (ID: {user.id})\n\n"
-                    f"Для кастомного ответа:\n"
-                    f"/reply {user.id} <ваш текст>"
+                    f"Чтобы ответить вручную, нажми Reply на это сообщение и напиши:\n"
+                    f"/reply <твой текст>"
                 ),
-                reply_markup=build_keyboard(user.id)
+                reply_markup=keyboard(user.id)
             )
+            set_mapping(decision_msg.message_id, user.id)
 
         await msg.reply_text("Спасибо! Мы получили твою заявку и вернёмся с ответом.")
-    except Exception as e:
-        logger.exception("Failed to handle submission")
+    except Exception:
+        logger.exception("Failed to process candidate submission")
         await msg.reply_text("Произошла ошибка при отправке заявки. Попробуй ещё раз позже.")
+
 
 async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
+    if not query or not query.message:
         return
 
     await query.answer()
@@ -150,49 +238,72 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, user_id_raw = query.data.split(":")
         user_id = int(user_id_raw)
     except Exception:
-        if query.message:
-            await query.message.reply_text("Ошибка обработки кнопки.")
+        await query.message.reply_text("Ошибка обработки кнопки.")
+        return
+
+    # Уже приняли решение ранее
+    if has_decision(user_id):
+        await query.answer("Решение уже принято", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
     if action == "accept":
-        reply_text = (
+        text = (
             "Спасибо за отклик! Ты подходишь нам на следующий этап.\n\n"
             "Мы хотим пригласить тебя на короткое собеседование."
         )
-        status_text = f"Кандидату {user_id} отправлен ответ: ПОДХОДИТ ✅"
+        status = "Статус: ПОДХОДИТ ✅"
+        decision_value = "accepted"
     else:
-        reply_text = (
+        text = (
             "Спасибо за отклик и за время, которое ты уделил заявке.\n\n"
             "Сейчас мы не готовы двигаться дальше, но благодарим за интерес к команде."
         )
-        status_text = f"Кандидату {user_id} отправлен ответ: НЕ ПОДХОДИТ ❌"
+        status = "Статус: НЕ ПОДХОДИТ ❌"
+        decision_value = "rejected"
 
     try:
-        await context.bot.send_message(chat_id=user_id, text=reply_text)
-        if query.message:
-            await query.message.reply_text(status_text)
+        await context.bot.send_message(chat_id=user_id, text=text)
+        mark_decision(user_id, decision_value)
+
+        # убираем кнопки
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        # дописываем статус
+        try:
+            old_text = query.message.text or ""
+            new_text = f"{old_text}\n\n{status}"
+            if len(new_text) <= 4096:
+                await query.edit_message_text(new_text)
+            else:
+                await query.message.reply_text(status)
+        except Exception:
+            await query.message.reply_text(status)
+
     except Exception as e:
         logger.exception("Failed to send decision")
-        if query.message:
-            await query.message.reply_text(f"Не удалось отправить ответ кандидату: {e}")
+        await query.message.reply_text(f"Не удалось отправить ответ кандидату: {e}")
+
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("chatid", chatid_cmd))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("reply", reply_cmd))
     app.add_handler(CallbackQueryHandler(handle_decision))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_submission))
 
-    logger.info("Bot polling started")
+    logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
