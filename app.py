@@ -62,8 +62,8 @@ def build_decision_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Подходит", callback_data=f"accept:{user_id}"),
-                InlineKeyboardButton("❌ Не подходит", callback_data=f"reject:{user_id}"),
+                InlineKeyboardButton("✅ Отлично, подходит", callback_data=f"accept:{user_id}"),
+                InlineKeyboardButton("❌ К сожалению нет", callback_data=f"reject:{user_id}"),
             ]
         ]
     )
