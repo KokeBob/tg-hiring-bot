@@ -98,6 +98,11 @@ def mark_decision(user_id: int, decision: str) -> None:
     save_state(STATE)
 
 
+def clear_decision(user_id: int) -> None:
+    STATE["decisions"].pop(str(user_id), None)
+    save_state(STATE)
+
+
 def save_user_info(user_id: int, full_name: str, username: str | None, chat_id: int | None = None) -> None:
     existing = STATE["users"].get(str(user_id), {})
     STATE["users"][str(user_id)] = {
@@ -255,6 +260,9 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_user_info(user.id, user.full_name, user.username, chat.id)
 
+    # ВАЖНО: новая заявка = старое решение сбрасываем
+    clear_decision(user.id)
+
     header = (
         "Новая заявка\n\n"
         f"Имя: {user.full_name}\n"
@@ -345,8 +353,11 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     else:
         text = (
-            "Спасибо за отклик и за время, которое ты уделил заявке.\n\n"
-            "Сейчас мы не готовы двигаться дальше, но благодарим за интерес к команде."
+            "Спасибо за заявку! Мы внимательно всё прочитали.\n\n"
+            "К сожалению, на текущий момент наши основные потребности по этому профилю и набору скиллов уже закрыты, "
+            "поэтому сейчас не сможем позвать тебя дальше в процесс.\n\n"
+            "Но нам было очень приятно познакомиться с твоей заявкой. Будем рады увидеться на финале и, возможно, "
+            "пересечься в других форматах в будущем."
         )
         status = "Статус: НЕ ПОДХОДИТ ❌"
         decision_value = "rejected"
