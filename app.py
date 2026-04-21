@@ -32,7 +32,9 @@ HELP_TEXT = (
     "/chatid — показать ID текущего чата\n"
     "/reply <текст> — ответить кандидату, если команда отправлена reply на карточку кандидата\n"
     "/reply <user_id> <текст> — ответить кандидату вручную по user_id\n"
-    "/waitlist — показать список кандидатов в резерве\n\n"
+    "/waitlist — показать список кандидатов в резерве\n"
+    "/broadcast_stats — показать статистику перед массовой рассылкой\n"
+    "/broadcast_closed — отправить всем уникальным кандидатам сообщение о завершении набора\n\n"
     "Рекомендуемый способ ответа:\n"
     "1. В админ-чате нажми Reply на сообщение по кандидату\n"
     "2. Напиши /reply <твой текст>"
@@ -127,7 +129,7 @@ async def send_feedback_to_candidate(
 
     if not chat_id:
         raise RuntimeError(
-            "У кандидата не найден chat_id. Пусть кандидат сначала напишет боту или заново отправит заявку."
+            "У кандидата не найден chat_id. Скорее всего это старая заявка, сохранённая до фикса chat_id."
         )
 
     await context.bot.send_message(chat_id=chat_id, text=text)
@@ -144,6 +146,46 @@ def get_waitlist_users():
                 "username": info.get("username", ""),
             })
     return result
+
+
+def get_unique_candidate_chat_ids():
+    seen = set()
+    result = []
+
+    for _, info in STATE["users"].items():
+        chat_id = info.get("chat_id")
+        if isinstance(chat_id, int) and chat_id not in seen:
+            seen.add(chat_id)
+            result.append(chat_id)
+
+    return result
+
+
+async def broadcast_to_all_candidates(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+):
+    chat_ids = get_unique_candidate_chat_ids()
+
+    sent = 0
+    failed = 0
+    failed_list = []
+
+    for chat_id in chat_ids:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            failed_list.append((chat_id, str(e)))
+            logger.exception(f"Failed to send broadcast to chat_id={chat_id}")
+
+    return {
+        "total_unique": len(chat_ids),
+        "sent": sent,
+        "failed": failed,
+        "failed_list": failed_list,
+    }
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -191,6 +233,60 @@ async def waitlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text("\n".join(lines))
+
+
+async def broadcast_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_chat(update):
+        return
+    if not update.message:
+        return
+
+    total_users = len(STATE["users"])
+    unique_chat_ids = get_unique_candidate_chat_ids()
+
+    await update.message.reply_text(
+        "Статистика рассылки:\n\n"
+        f"Пользователей в STATE['users']: {total_users}\n"
+        f"Уникальных chat_id для рассылки: {len(unique_chat_ids)}"
+    )
+
+
+async def broadcast_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_chat(update):
+        return
+    if not update.message:
+        return
+
+    message_text = (
+        "Спасибо за интерес к нашей команде и за отправленную заявку.\n\n"
+        "На данный момент мы уже завершили набор и собрали состав команды, "
+        "поэтому дальше продолжить процесс, к сожалению, не сможем.\n\n"
+        "Спасибо, что нашли время откликнуться. Будем рады увидеться с вами "
+        "в других проектах, форматах и на будущих отборах."
+    )
+
+    await update.message.reply_text("Начинаю рассылку по всем уникальным кандидатам...")
+
+    result = await broadcast_to_all_candidates(context, message_text)
+
+    report = (
+        "Рассылка завершена.\n\n"
+        f"Уникальных chat_id найдено: {result['total_unique']}\n"
+        f"Успешно отправлено: {result['sent']}\n"
+        f"Ошибок отправки: {result['failed']}"
+    )
+
+    await update.message.reply_text(report)
+
+    if result["failed_list"]:
+        lines = ["Не удалось отправить следующим chat_id:\n"]
+        for chat_id, err in result["failed_list"][:20]:
+            lines.append(f"{chat_id}: {err}")
+
+        if len(result["failed_list"]) > 20:
+            lines.append(f"\n...и ещё {len(result['failed_list']) - 20}")
+
+        await update.message.reply_text("\n".join(lines))
 
 
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -260,7 +356,7 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_user_info(user.id, user.full_name, user.username, chat.id)
 
-    # ВАЖНО: новая заявка = старое решение сбрасываем
+    # Новая заявка = старое решение сбрасываем
     clear_decision(user.id)
 
     header = (
@@ -400,12 +496,17 @@ def main():
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("reply", reply_cmd))
     app.add_handler(CommandHandler("waitlist", waitlist_cmd))
+    app.add_handler(CommandHandler("broadcast_stats", broadcast_stats_cmd))
+    app.add_handler(CommandHandler("broadcast_closed", broadcast_closed_cmd))
     app.add_handler(CallbackQueryHandler(handle_decision))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_submission))
 
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
